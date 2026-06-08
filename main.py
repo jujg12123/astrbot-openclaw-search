@@ -4,7 +4,7 @@
   1. /websearch [关键词] — 手动触发搜索
   2. web_search — LLM函数工具，AI在对话中可**主动调用**搜索
 
-支持的搜索引擎（通过配置文件选择）：
+支持的搜索引擎（通过插件配置界面选择）：
   - sogou    搜狗搜索（中文友好，推荐）
   - google   Google 搜索
   - bing     Bing 搜索
@@ -18,20 +18,16 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import html as html_module
-from typing import Optional
+from typing import Optional, List, Dict
 
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.agent.tool import FunctionTool, ToolExecResult
-from pydantic import Field
-from pydantic.dataclasses import dataclass
 
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════
 # 搜索引擎定义
-# ──────────────────────────────────────────────
-SEARCH_ENGINES = {
+# ═══════════════════════════════════════════
+SEARCH_ENGINES: Dict[str, dict] = {
     "sogou": {
         "name": "搜狗搜索",
         "url_pattern": "https://www.sogou.com/web?query={query}",
@@ -65,10 +61,10 @@ SEARCH_ENGINES = {
 }
 
 
-# ──────────────────────────────────────────────
-# 各引擎解析器
-# ──────────────────────────────────────────────
-def _parse_sogou(html: str) -> list:
+# ═══════════════════════════════════════════
+# HTML 解析器
+# ═══════════════════════════════════════════
+def _parse_sogou(html: str) -> List[dict]:
     results = []
     titles = re.findall(
         r'<h3[^>]*class="(?:vr-title[^"]*)"[^>]*>.*?<a[^>]*>(.*?)</a>',
@@ -90,21 +86,19 @@ def _parse_sogou(html: str) -> list:
         snippet = ""
         if i < len(descriptions):
             snippet = re.sub(r"<.*?>", "", descriptions[i]).strip()
-            snippet = html_module.unescape(snippet)[:150]
+            snippet = html_module.unescape(snippet)[:200]
         url = links[i] if i < len(links) else ""
         if url.startswith("/link?url="):
             url = "https://www.sogou.com" + url
         elif url.startswith("/"):
             url = "https://www.sogou.com" + url
-        elif not url:
-            url = ""
         results.append({"title": title, "snippet": snippet, "url": url})
         if len(results) >= 10:
             break
     return results
 
 
-def _parse_google(html: str) -> list:
+def _parse_google(html: str) -> List[dict]:
     results = []
     blocks = re.findall(
         r'<div[^>]*class="[^"]*g[^"]*"[^>]*>.*?<h3[^>]*>(.*?)</h3>.*?</div>',
@@ -122,7 +116,7 @@ def _parse_google(html: str) -> list:
         desc_match = re.search(r'<[^>]*class="[^"]*[^"]*"[^>]*>(.*?)</[^>]*>', block, re.DOTALL)
         if desc_match:
             snippet = re.sub(r"<.*?>", "", desc_match.group(1)).strip()
-            snippet = html_module.unescape(snippet)[:150]
+            snippet = html_module.unescape(snippet)[:200]
         link_match = re.search(r'href="(/url\?q=([^"&]+))', block)
         url = ""
         if link_match:
@@ -134,7 +128,7 @@ def _parse_google(html: str) -> list:
     return results
 
 
-def _parse_bing(html: str) -> list:
+def _parse_bing(html: str) -> List[dict]:
     results = []
     b_blocks = re.findall(
         r'<li[^>]*class="b_algo"[^>]*>.*?</li>',
@@ -152,7 +146,7 @@ def _parse_bing(html: str) -> list:
         snippet = ""
         if desc_match:
             snippet = re.sub(r"<.*?>", "", desc_match.group(1)).strip()
-            snippet = html_module.unescape(snippet)[:150]
+            snippet = html_module.unescape(snippet)[:200]
         link_match = re.search(r'<a[^>]*href="([^"]+)"', block)
         url = link_match.group(1) if link_match else ""
         results.append({"title": title, "snippet": snippet, "url": url})
@@ -168,41 +162,49 @@ PARSERS = {
 }
 
 
-# ──────────────────────────────────────────────
-# LLM 函数工具（FunctionTool 格式）
-# ──────────────────────────────────────────────
-@dataclass
-class WebSearchTool(FunctionTool):
-    name: str = "web_search"
-    description: str = "搜索互联网获取实时信息。当你需要了解最新事实、新闻或你没有的数据时使用。返回包含标题、摘要和链接的结构化结果。"
-    parameters: dict = Field(
-        default_factory=lambda: {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "用户想要搜索的关键词。"
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "期望返回的搜索结果数量。默认为5。",
-                    "default": 5
-                }
-            },
-            "required": ["query"]
-        }
-    )
+# ═══════════════════════════════════════════
+# 格式化输出（Web Search Skill 风格）
+# ═══════════════════════════════════════════
+def _format_results(query: str, results: List[dict], engine_name: str) -> str:
+    """用结构化格式输出搜索结果"""
+    if not results:
+        return f'🔍 关于「{query}」未找到{engine_name}搜索结果，请换个关键词试试。'
+
+    top_results = results[:5]
+    core = top_results[0]
+    lines = [
+        f'🔍 **关于「{query}」的检索结果（{engine_name}）**',
+        '',
+        '### 📌 核心发现',
+        f'**{core["title"]}**',
+        f'> {core["snippet"]}',
+        f'> 🔗 {core["url"]}',
+        '',
+        '### 📋 详细信息',
+    ]
+
+    for i, r in enumerate(top_results, 1):
+        lines.append(
+            f'{i}. **{r["title"]}**\n'
+            f'   {"- " + r["snippet"] if r["snippet"] else ""}\n'
+            f'   {"来源：" + r["url"] if r["url"] else ""}'
+        )
+
+    # 建议
+    lines.append('')
+    lines.append('### 💡 建议')
+    lines.append(f'以上结果来自{engine_name}，如需更精确信息，可以尝试更具体的关键词搜索。')
+
+    return '\n'.join(lines)
 
 
-# ──────────────────────────────────────────────
-# 搜索逻辑（被 @register 装饰的类调用）
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════
+# 搜索逻辑
+# ═══════════════════════════════════════════
 class SearchEngine:
-    def __init__(self, context: Context):
-        self.context = context
-        self.enabled = True
-        self.engine = "sogou"
-        self.max_results = 5
+    def __init__(self):
+        self.engine: str = "sogou"
+        self.max_results: int = 5
 
     def search(self, query: str, max_results: int = None) -> str:
         """执行搜索并返回格式化文本"""
@@ -218,67 +220,72 @@ class SearchEngine:
                 html = response.read().decode("utf-8", errors="replace")
                 parser = PARSERS.get(engine_cfg["parse"])
                 results = parser(html) if parser else []
-            if not results:
-                return f'未找到 "{query}" 的{engine_name}搜索结果。'
-            lines = [f'"{query}" 的{engine_name}搜索（共找到 {len(results)} 条结果）：\n']
-            for i, r in enumerate(results, 1):
-                lines.append(
-                    f"[{i}] {r['title']}\n"
-                    f"    {r['snippet']}\n"
-                    f"    URL: {r['url']}"
-                )
-            return "\n\n".join(lines)
+            return _format_results(query, results, engine_name)
         except urllib.error.HTTPError as e:
-            return f"搜索 HTTP 错误: {e.code} {e.reason}"
+            return f'🔍 搜索 HTTP 错误 ({e.code})：{e.reason}\n请稍后重试或更换搜索引擎。'
         except urllib.error.URLError as e:
-            return f"搜索网络错误: {e.reason}"
+            return f'🔍 搜索网络错误：{e.reason}\n请检查网络连接后重试。'
         except TimeoutError:
-            return "搜索超时，请稍后重试。"
+            return '🔍 搜索超时，请稍后重试。'
         except Exception as e:
-            return f"搜索出错: {type(e).__name__}: {e}"
+            return f'🔍 搜索出错：{type(e).__name__} - {e}'
 
 
-# ──────────────────────────────────────────────
+# ═══════════════════════════════════════════
 # AstrBot 插件注册
-# ──────────────────────────────────────────────
-@register("astrbot_plugin_openclaw_search", "openclaw", "多引擎搜索（搜狗/Google/Bing，含LLM函数调用）", "3.0.1")
+# ═══════════════════════════════════════════
+@register("astrbot_plugin_web_search", "openclaw", "多引擎搜索（搜狗/Google/Bing，含LLM函数调用）", "3.0.2")
 class OpenClawSearchPlugin(Star):
-    """多引擎搜索插件
+    """多引擎搜索插件 — v3.0.2
 
     功能：
       - /websearch 命令：手动执行搜索
-      - web_search 函数工具：AI在对话中主动调用搜索
+      - web_search 函数工具：AI 在对话中主动调用搜索
 
     配置项（data/plugin_config/openclaw_web_search.json）：
-      engine:     搜索引擎，可选 sogou / google / bing（默认 sogou）
-      enabled:    是否启用（默认 true）
+      engine:      搜索引擎，可选 sogou / google / bing（默认 sogou）
       max_results: 最大结果数（默认 5）
     """
 
     def __init__(self, context: Context):
         super().__init__(context)
-        # 尝试从配置文件加载
-        self.config = context.parse_config(__file__, "openclaw_web_search") if hasattr(context, "parse_config") else {}
-        self.search_engine = SearchEngine(context)
-        self.search_engine.enabled = self.config.get("enabled", True)
-        self.search_engine.engine = self.config.get("engine", "sogou")
-        self.search_engine.max_results = self.config.get("max_results", 5)
-        if self.search_engine.engine not in SEARCH_ENGINES:
+
+        # 默认配置
+        self._engine: str = "sogou"
+        self._max_results: int = 5
+
+        # 尝试加载配置文件
+        try:
+            cfg = context.get_config()
+            self._engine = cfg.get("engine", "sogou")
+            self._max_results = int(cfg.get("max_results", 5))
+        except Exception:
+            logger.info("[OpenClawSearch] 未找到配置文件，使用默认配置")
+
+        # 校验引擎
+        if self._engine not in SEARCH_ENGINES:
             logger.warning(
-                f"[OpenClawSearch] 引擎 '{self.search_engine.engine}' 无效，"
-                f"默认使用 sogou。可用引擎: {', '.join(SEARCH_ENGINES.keys())}"
+                f"[OpenClawSearch] 引擎 '{self._engine}' 无效，回退到 sogou。"
+                f"可用引擎: {', '.join(SEARCH_ENGINES.keys())}"
             )
-            self.search_engine.engine = "sogou"
-        logger.info(f"[OpenClawSearch] 插件已初始化，引擎={self.search_engine.engine}")
+            self._engine = "sogou"
+
+        # 初始化搜索引擎
+        self.search_engine = SearchEngine()
+        self.search_engine.engine = self._engine
+        self.search_engine.max_results = self._max_results
+
+        logger.info(f"[OpenClawSearch] v3.0.2 已就绪 | 引擎={self._engine} | 最大结果={self._max_results}")
 
     @filter.command("websearch")
     async def on_command(self, event: AstrMessageEvent, args: str):
         """使用方式：/websearch 搜索内容"""
         if not args or not args.strip():
             yield event.make_result().message(
-                "请提供搜索内容，例如：/websearch 今日天气"
+                "🔍 请提供搜索内容，例如：/websearch 今日天气"
             )
             return
         query = args.strip()
+        logger.info(f"[OpenClawSearch] 手动搜索: {query}")
         result = self.search_engine.search(query)
         yield event.make_result().message(result)
