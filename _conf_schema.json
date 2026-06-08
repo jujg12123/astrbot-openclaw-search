@@ -4,14 +4,19 @@
     "type": "string",
     "default": "sogou",
     "enum": ["sogou", "google", "bing"],
-    "hint": "推荐使用搜狗搜索（中文支持最好）"
+    "enum_desc": {
+      "sogou": "搜狗搜索 — 中文友好，国内最稳定",
+      "google": "Google 搜索 — 结果全面，需网络环境支持",
+      "bing": "Bing 搜索 — 微软搜索引擎，国内可直连"
+    },
+    "hint": "选择你想要使用的搜索引擎"
   },
   "max_results": {
-    "description": "最大搜索结果数量",
+    "description": "最大搜索结果数",
     "type": "int",
     "default": 5,
     "min": 1,
     "max": 10,
-    "hint": "控制每次搜索返回的结果条数"
+    "hint": "每次搜索返回的结果条数（1-10）"
   }
 }
