@@ -1,13 +1,10 @@
 """多引擎搜索插件 for AstrBot
 
 功能：
-  1. /websearch [关键词] — 手动触发搜索
-  2. web_search — LLM 函数工具，AI 在对话中可**主动调用**搜索
+  /websearch [关键词] — 手动搜索（结构化输出）
+  web_search — LLM 函数工具，AI 可在对话中主动调用联网搜索
 
-支持的搜索引擎：
-  - sogou    搜狗搜索（中文友好，推荐）
-  - google   Google 搜索
-  - bing     Bing 搜索
+引擎：搜狗（推荐）/ Google / Bing
 """
 
 import asyncio
@@ -16,18 +13,14 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import html as html_module
+from dataclasses import dataclass, field
 
-from pydantic import Field
-from pydantic.dataclasses import dataclass
-
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api import logger, FunctionTool
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
-from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.agent.tool import FunctionTool, ToolExecResult
-from astrbot.core.astr_agent_context import AstrAgentContext
+from astrbot.core.star.filter.command import GreedyStr
 
-# ═══════════════════════ 搜索引擎定义 ═══════════════════════
+# ═════════════════════════ 搜索引擎 ═════════════════════════
 SEARCH_ENGINES = {
     "sogou": {
         "name": "搜狗",
@@ -56,7 +49,7 @@ SEARCH_ENGINES = {
 }
 
 
-# ═══════════════════════ HTML 解析器 ═══════════════════════
+# ═════════════════════════ HTML 解析 ═════════════════════════
 def _parse_sogou(html: str) -> list:
     results = []
     titles = re.findall(r'<h3[^>]*class="(?:vr-title[^"]*)"[^>]*>.*?<a[^>]*>(.*?)</a>', html, re.DOTALL)
@@ -64,15 +57,12 @@ def _parse_sogou(html: str) -> list:
     links = re.findall(r'<h3[^>]*class="(?:vr-title[^"]*)"[^>]*>.*?<a[^>]*href="([^"]*)"', html, re.DOTALL)
     for i in range(min(len(titles), 10)):
         title = html_module.unescape(re.sub(r"<.*?>", "", titles[i]).strip())
-        if not title or len(title) <= 3:
-            continue
+        if not title or len(title) <= 3: continue
         snippet = html_module.unescape(re.sub(r"<.*?>", "", descs[i]).strip())[:200] if i < len(descs) else ""
         url = links[i] if i < len(links) else ""
-        if url.startswith("/"):
-            url = "https://www.sogou.com" + url
+        if url.startswith("/"): url = "https://www.sogou.com" + url
         results.append({"title": title, "snippet": snippet, "url": url})
-        if len(results) >= 10:
-            break
+        if len(results) >= 10: break
     return results
 
 
@@ -88,8 +78,7 @@ def _parse_google(html: str) -> list:
         snippet = html_module.unescape(re.sub(r"<.*?>", "", sm.group(1)).strip())[:200] if sm else ""
         lm = re.search(r'href="(/url\?q=([^"&]+))', block)
         url = urllib.parse.unquote(lm.group(2)) if lm else ""
-        if url:
-            results.append({"title": title, "snippet": snippet, "url": url})
+        if url: results.append({"title": title, "snippet": snippet, "url": url})
         if len(results) >= 10: break
     return results
 
@@ -114,8 +103,9 @@ def _parse_bing(html: str) -> list:
 PARSERS = {"sogou": _parse_sogou, "google": _parse_google, "bing": _parse_bing}
 
 
-# ═══════════════════════ 格式化输出 ═══════════════════════
-def _format_results(query: str, results: list, engine_name: str) -> str:
+# ═════════════════════════ 格式化 ═════════════════════════
+def _format_for_user(query: str, results: list, engine_name: str) -> str:
+    """给用户看的富格式"""
     if not results:
         return f'🔍 「{query}」未找到相关结果，请换个关键词试试。'
     top = results[:5]
@@ -123,42 +113,68 @@ def _format_results(query: str, results: list, engine_name: str) -> str:
     lines = [
         f'🔍 **关于「{query}」的搜索结果（{engine_name}）**',
         '',
-        '📌 **核心发现**',
+        f'📌 **核心发现**',
         f'**{core["title"]}**',
         f'> {core["snippet"]}',
         f'> 🔗 {core["url"]}',
         '',
-        '📋 **详细信息**',
+        f'📋 **详细信息**',
     ]
     for i, r in enumerate(top, 1):
         lines.append(f'{i}. **{r["title"]}**')
-        if r["snippet"]:
-            lines.append(f'   - {r["snippet"]}')
-        if r["url"]:
-            lines.append(f'   🔗 {r["url"]}')
+        if r["snippet"]: lines.append(f'   - {r["snippet"]}')
+        if r["url"]: lines.append(f'   🔗 {r["url"]}')
     lines.append('')
-    lines.append(f'💡 以上结果来自{engine_name}，如需更精确信息可尝试更具体的关键词。')
+    lines.append(f'💡 以上结果来自{engine_name}，可尝试更具体的关键词。')
     return '\n'.join(lines)
 
 
-# ═══════════════════════ 搜索引擎 ═══════════════════════
-class SearchEngine:
-    def __init__(self):
-        self.engine: str = "sogou"
-        self.max_results: int = 5
+def _format_for_llm(query: str, results: list, engine_name: str) -> str:
+    """给 LLM 看的纯文本，让 AI 能更好理解搜索结果"""
+    if not results:
+        return f'未找到关于 "{query}" 的搜索结果。'
+    lines = [f'以下是关于 "{query}" 的{engine_name}搜索结果：', '']
+    for i, r in enumerate(results[:5], 1):
+        lines.append(f'{i}. {r["title"]}')
+        if r["snippet"]: lines.append(f'   摘要: {r["snippet"]}')
+        if r["url"]: lines.append(f'   链接: {r["url"]}')
+    lines.append('')
+    lines.append('请根据以上搜索结果，帮用户总结要点并回答。')
+    return '\n'.join(lines)
 
-    def search_sync(self, query: str, max_results: int = None) -> str:
-        """同步搜索（供 LLM 函数工具调用）"""
-        max_r = max_results or self.max_results
+
+# ═════════════════════════ 搜索后端 ═════════════════════════
+class SearchBackend:
+    def __init__(self, engine: str = "sogou"):
+        self.engine = engine
+
+    def search(self, query: str, max_results: int = 5) -> str:
         cfg = SEARCH_ENGINES.get(self.engine, SEARCH_ENGINES["sogou"])
-        engine_name = cfg["name"]
         try:
-            url = cfg["url"].format(query=urllib.parse.quote(query), num=max_r)
+            url = cfg["url"].format(query=urllib.parse.quote(query), num=max_results)
             req = urllib.request.Request(url, headers=dict(cfg["headers"]))
             with urllib.request.urlopen(req, timeout=15) as resp:
                 html = resp.read().decode("utf-8", errors="replace")
             results = PARSERS.get(self.engine, _parse_sogou)(html)
-            return _format_results(query, results, engine_name)
+            return _format_for_llm(query, results, cfg["name"])
+        except urllib.error.HTTPError as e:
+            return f'搜索 HTTP 错误({e.code})，请稍后重试。'
+        except urllib.error.URLError as e:
+            return f'搜索网络错误：{e.reason}'
+        except TimeoutError:
+            return '搜索超时，请稍后重试。'
+        except Exception as e:
+            return f'搜索出错：{type(e).__name__} - {e}'
+
+    def search_for_user(self, query: str, max_results: int = 5) -> str:
+        cfg = SEARCH_ENGINES.get(self.engine, SEARCH_ENGINES["sogou"])
+        try:
+            url = cfg["url"].format(query=urllib.parse.quote(query), num=max_results)
+            req = urllib.request.Request(url, headers=dict(cfg["headers"]))
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+            results = PARSERS.get(self.engine, _parse_sogou)(html)
+            return _format_for_user(query, results, cfg["name"])
         except urllib.error.HTTPError as e:
             return f'🔍 搜索 HTTP 错误({e.code})，请稍后重试。'
         except urllib.error.URLError as e:
@@ -169,89 +185,79 @@ class SearchEngine:
             return f'🔍 搜索出错：{type(e).__name__} - {e}'
 
 
-# ═══════════════════════ LLM 函数工具 ═══════════════════════
+# ═════════════════════════ LLM 函数工具 ═════════════════════════
 @dataclass
-class WebSearchTool(FunctionTool[AstrAgentContext]):
-    """llm 可调用的搜索工具"""
+class WebSearchTool(FunctionTool):
+    """LLM 可调用的联网搜索工具，搜索结果会直接反馈给 LLM 用于回答"""
+    backend: SearchBackend = field(repr=False, default_factory=SearchBackend)
     name: str = "web_search"
     description: str = (
-        "搜索互联网获取最新信息。当需要了解实时资讯、新闻事实、天气、百科等"
-        "对话外的信息时调用。返回结构化结果，包含核心发现和详细条目。"
+        "搜索互联网获取实时信息。当你需要了解最新事实、新闻、数据、百科等"
+        "超出你知识范围的信息时调用此工具。返回搜索结果后请根据内容回答用户。"
     )
-    parameters: dict = Field(
+    parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "用户想要搜索的关键词，请提取核心提问内容。"
+                    "description": "搜索关键词或问题，提取用户的核心查询意图。"
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "期望返回的结果数量，默认5。",
-                    "default": 5
-                }
+                    "description": "返回结果数量，1-10，默认5。",
+                    "default": 5,
+                },
             },
-            "required": ["query"]
+            "required": ["query"],
         }
     )
 
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        query = kwargs.get("query", "")
-        max_results = kwargs.get("max_results", 5)
-        logger.info(f"[WebSearch] LLM 调用搜索: '{query}'")
-        # 用 asyncio.to_thread 避免阻塞
-        result = await asyncio.to_thread(self._engine.search_sync, query, max_results)
-        return ToolExecResult(result)
+    async def run(self, event: AstrMessageEvent, query: str, max_results: int = 5) -> str:
+        _ = event
+        logger.info(f"[WebSearch] LLM 调用搜索: '{query}' (max={max_results})")
+        result = await asyncio.to_thread(self.backend.search, query, max(1, min(max_results, 10)))
+        return result
 
 
-# ═══════════════════════ 插件注册 ═══════════════════════
-@register("astrbot_plugin_web_search", "openclaw", "多引擎搜索（搜狗/Google/Bing）", "3.0.3")
+# ═════════════════════════ 插件 ═════════════════════════
+@register(
+    "astrbot_plugin_web_search",
+    "openclaw",
+    "多引擎搜索（搜狗/Google/Bing），LLM可主动调用，搜索结果反馈给AI用于回答",
+    "3.1.0",
+    "https://github.com/jujg12123/astrbot-web-search",
+)
 class WebSearchPlugin(Star):
-    """多引擎搜索插件
-
-    功能：
-      - /websearch 命令：手动执行搜索，结构化输出
-      - web_search 函数工具：AI 在对话中主动调用搜索
-
-    配置（data/plugin_config/astrbot_plugin_web_search.json）：
-      engine:      搜索引擎（sogou / google / bing）
-      max_results: 最大结果数（默认5）
-    """
-
     def __init__(self, context: Context):
         super().__init__(context)
 
-        # 读取配置
-        self._engine = "sogou"
-        self._max_results = 5
+        engine = "sogou"
         try:
             cfg = context.get_config()
-            self._engine = cfg.get("engine", "sogou")
-            self._max_results = int(cfg.get("max_results", 5))
+            engine = cfg.get("engine", "sogou")
         except Exception:
             pass
+        if engine not in SEARCH_ENGINES:
+            engine = "sogou"
 
-        if self._engine not in SEARCH_ENGINES:
-            self._engine = "sogou"
-
-        # 初始化搜索后端
-        self._search = SearchEngine()
-        self._search.engine = self._engine
-        self._search.max_results = self._max_results
+        self._backend = SearchBackend(engine)
+        self._tool = WebSearchTool(backend=self._backend)
 
         # 注册 LLM 函数工具
-        tool = WebSearchTool()
-        tool._engine = self._search   # 绑定后端
-        self.web_search_tool = tool
+        context.add_llm_tools(self._tool)
+        logger.info(f"[WebSearch] v3.1.0 已就绪 | 引擎={engine}")
 
-        logger.info(f"[WebSearch] v3.0.3 就绪 | 引擎={self._engine} | 最大结果={self._max_results}")
+    async def terminate(self):
+        """插件卸载时清理"""
+        self.context.provider_manager.llm_tools.remove_func(self._tool.name)
+        logger.info("[WebSearch] 已卸载")
 
-    @filter.command("websearch")
-    async def on_command(self, event: AstrMessageEvent, args: str):
-        """手动搜索: /websearch 关键词"""
-        if not args or not args.strip():
-            yield event.make_result().message("🔍 用法：/websearch 关键词")
+    @filter.command("websearch", alias={"搜索", "websearch"})
+    async def on_command(self, event: AstrMessageEvent, query: GreedyStr):
+        query = query.strip()
+        if not query:
+            yield event.plain_result("🔍 用法：/websearch 关键词")
             return
-        result = await asyncio.to_thread(self._search.search_sync, args.strip())
-        yield event.make_result().message(result)
+        result = await asyncio.to_thread(self._backend.search_for_user, query)
+        yield event.plain_result(result)
