@@ -5,7 +5,7 @@
   /websearch changelog — 查看更新日志
   web_search — LLM 函数工具，AI 可在对话中主动调用联网搜索
 
-引擎：Bing（默认）/ 搜狗 / Google
+引擎：Bing（默认，中文自动引号精确匹配）/ 搜狗 / Google
 """
 
 import asyncio
@@ -25,12 +25,17 @@ from astrbot.core.star.filter.command import GreedyStr
 CHANGELOG = """
 📋 **多引擎搜索插件 更新日志**
 
+**v3.1.4** (2026-06-08)
+- 🐛 修复 Bing 搜索中文时自动拆单字的问题
+  - 新增 CJK 字符检测：Bing 搜索含中文时自动加双引号
+  - 例如 "原神" 不再被拆成 "原"+"神" 搜出字典条目
+- 🌐 默认搜索引擎仍为 Bing
+
 **v3.1.3** (2026-06-08)
 - 🔧 修复搜索结果被 skills 层二次加工导致信息失真的问题
   - 移除 LLM 工具中的"帮用户总结"指令，搜索结果原样返回给 AI
   - 用户命令输出保留结构化格式但去除非核心的"建议"段落
 - 📊 默认结果数从 5 提升到 8，信息量更大
-- 🌐 默认搜索引擎仍为 Bing
 
 **v3.1.2** (2026-06-08)
 - 🔧 修复插件配置不生效的问题（改为接收 AstrBotConfig）
@@ -77,6 +82,18 @@ SEARCH_ENGINES = {
         },
     },
 }
+
+
+# ═════════════════════════ 查询预处理 ═════════════════════════
+_CJK_RE = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
+
+
+def _preprocess_query(query: str, engine: str) -> str:
+    """Bing 中文搜索会将复合词拆成单字（原神 → 原 + 神），
+       检测到 CJK 字符时自动加双引号强制短语匹配。"""
+    if engine == "bing" and _CJK_RE.search(query):
+        return f'"{query}"'
+    return query
 
 
 # ═════════════════════════ HTML 解析 ═════════════════════════
@@ -199,7 +216,8 @@ class SearchBackend:
         """供 LLM 工具调用，返回纯搜索结果"""
         cfg = SEARCH_ENGINES.get(self.engine, SEARCH_ENGINES["bing"])
         try:
-            url = cfg["url"].format(query=urllib.parse.quote(query), num=max_results)
+            q = _preprocess_query(query, self.engine)
+            url = cfg["url"].format(query=urllib.parse.quote(q), num=max_results)
             req = urllib.request.Request(url, headers=dict(cfg["headers"]))
             with urllib.request.urlopen(req, timeout=15) as resp:
                 html = resp.read().decode("utf-8", errors="replace")
@@ -218,7 +236,8 @@ class SearchBackend:
         """供用户命令调用，返回结构化显示"""
         cfg = SEARCH_ENGINES.get(self.engine, SEARCH_ENGINES["bing"])
         try:
-            url = cfg["url"].format(query=urllib.parse.quote(query), num=max_results)
+            q = _preprocess_query(query, self.engine)
+            url = cfg["url"].format(query=urllib.parse.quote(q), num=max_results)
             req = urllib.request.Request(url, headers=dict(cfg["headers"]))
             with urllib.request.urlopen(req, timeout=15) as resp:
                 html = resp.read().decode("utf-8", errors="replace")
@@ -273,7 +292,7 @@ class WebSearchTool(FunctionTool):
     "astrbot_plugin_web_search",
     "openclaw",
     "多引擎搜索（Bing/搜狗/Google），LLM可主动调用，默认Bing",
-    "3.1.3",
+    "3.1.4",
     "https://github.com/jujg12123/astrbot-web-search",
 )
 class WebSearchPlugin(Star):
@@ -288,7 +307,7 @@ class WebSearchPlugin(Star):
         self._backend = SearchBackend(engine)
         self._tool = WebSearchTool(backend=self._backend)
         context.add_llm_tools(self._tool)
-        logger.info(f"[WebSearch] v3.1.3 已就绪 | 引擎={engine}")
+        logger.info(f"[WebSearch] v3.1.4 已就绪 | 引擎={engine} | 中文引号优化=ON")
 
     async def terminate(self):
         self.context.provider_manager.llm_tools.remove_func(self._tool.name)
@@ -304,7 +323,7 @@ class WebSearchPlugin(Star):
 
         if not query:
             yield event.plain_result(
-                "🔍 **多引擎搜索插件 v3.1.3**\n"
+                "🔍 **多引擎搜索插件 v3.1.4**\n"
                 "用法：/websearch 关键词\n"
                 f"当前引擎：{self._backend.engine}\n"
                 "输入 /websearch changelog 查看更新日志"
